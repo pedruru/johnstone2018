@@ -9,4 +9,4 @@ Code Repository:
 * Interactome
 
 *Network Propagation Analysis not available in R language.*
-*(The analysis was done entirely through Cytoscape.)*
+*(The analysis was done entirely in Cytoscape.)*
