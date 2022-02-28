@@ -8,4 +8,5 @@ Code Repository:
 * Non-Coding Mutations
 * Interactome
 
-~ Network Propagation Analysis not available in R. Done entirely in Cytoscape.
+*Network Propagation Analysis not available in R language.*
+*(The analysis was done entirely through Cytoscape.)*
