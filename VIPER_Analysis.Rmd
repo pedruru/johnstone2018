@@ -1,0 +1,320 @@
+---
+title: "VIPER Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath('..'))
+knitr::opts_chunk$set(error = FALSE,
+                      warning = FALSE,
+                      message = FALSE)
+```
+
+Loading packages:
+
+```{r packages}
+library(tidyverse)
+library(aracne.networks)
+library(viper)
+source("scripts/tinkering_viper.R")
+library(ComplexHeatmap)
+library(kableExtra)
+```
+
+```{r functions, include=FALSE}
+select <- dplyr::select
+reduce <- purrr::reduce
+```
+
+Loading data:
+
+```{r data}
+counts_data <- read_csv("data/johnstone2018/GSE101745_genewise-count.csv") 
+gene_ids <- read_csv("tables/gene_ids.csv", col_types = cols(.default = "c"))
+
+names = c("LNA_vs_NIC", "LM2_vs_NIC", "HM_vs_NIC", "LM2_vs_LNA", "HM_vs_LNA", "HM_vs_LM2")
+tables <- list()
+for (i in 1:length(names)) {
+  tables[[i]] <- read_csv(paste0("tables/", names[i], ".csv")) %>% 
+    inner_join(gene_ids, by = c("rowname" = "SYMBOL")) %>% 
+    select(gene = GENEID, everything(), -c(Name, rowname, type_of_gene))
+}
+```
+
+# msVIPER
+
+The following tables and plots were made from DESeq2 results previously obtained. DESeq2 allowed for batch effects shown in PCA to be taken into account. The GES was set as the Wald statistic returned by DESeq2 analysis. Gene annotation was changed with the msviperAnnot function. Tables show the significant MRs (*FDR < 0.001*) whilst plots show, when possible, the top 10 putative MRs. The latter include a heatmap of NES (with red and blue being positive and negative respectively).
+
+Generating argument for msviperAnnot (*NCBI ID* to *HGNC SYMBOL*):
+
+```{r annot}
+annot <- gene_ids$SYMBOL
+names(annot) <- gene_ids$GENEID
+```
+
+## msVIPER analysis
+
+```{r msviper}
+msvpsig <- list()
+msvp <- list()
+mrs <- list()
+msvpres <- list()
+for (i in 1:length(names)) {
+  msvpsig[[i]] <- tables[[i]]$stat
+  attr(msvpsig[[i]], "names") <- tables[[i]]$gene
+  msvpsig[[i]] <- msvpsig[[i]] %>% subset(!is.na(.))
+  msvp[[i]] <- msviper(msvpsig[[i]], regulonbrca, verbose = FALSE) %>% 
+    msviperAnnot(annot)
+  
+  mrs[[i]] <- data.frame(FDR = signif(p.adjust(msvp[[i]]$es$p.value, "fdr"), 3),
+                         NES = msvp[[i]]$es$nes,
+                         MR = names(msvp[[i]]$regulon)) %>%
+    arrange(desc(NES)) %>% 
+    pull(MR)
+  
+  msvpres[[i]] <- summary(msvp[[i]], mrs = mrs[[i]])
+  names(msvpres)[i] <- names[i]
+}
+```
+
+## msVIPER results
+
+### LNA vs NIC
+
+```{r, echo=FALSE}
+msvpres[[1]] %>% filter(FDR < 0.001)
+plot_msviper(msvp[[1]], mrs = 10, include = c("activity"))
+```
+
+### LM2 vs NIC
+
+```{r, echo=FALSE}
+msvpres[[2]] %>% filter(FDR < 0.001)
+plot_msviper(msvp[[2]], mrs = 10, include = c("activity"))
+```
+
+### HM vs NIC
+
+```{r, echo=FALSE}
+msvpres[[3]] %>% filter(FDR < 0.001)
+plot_msviper(msvp[[3]], mrs = 10, include = c("activity"))
+```
+
+### LM2 vs LNA
+
+```{r, echo=FALSE}
+msvpres[[4]] %>% filter(FDR < 0.001)
+plot_msviper(msvp[[4]], mrs = 10, include = c("activity"))
+```
+
+### HM vs LNA
+
+```{r, echo=FALSE}
+msvpres[[5]] %>% filter(FDR < 0.001)
+plot_msviper(msvp[[5]], mrs = 10, include = c("activity"))
+```
+
+### HM vs LM2
+
+```{r, echo=FALSE}
+msvpres[[6]] %>% filter(FDR < 0.001)
+plot_msviper(msvp[[6]], mrs = 10, include = c("activity"))
+```
+
+# MR candidates
+
+The MRs returned by msVIPER analysis were filtered by a density plot of the raw counts from Johnstone et al. 2018, normalized by DESeq2. Those genes above the cutoff (set as *the first local minima* after plot analysis) were eligible for MR candidates.
+
+```{r TPM, eval=FALSE, include=FALSE}
+# counts_data %>% 
+#   separate_rows(Name, sep = "/") %>% 
+#   inner_join(gene_ids) %>%
+#   select(-c(Name, GENEID, type_of_gene)) %>%
+#   distinct(SYMBOL, .keep_all = TRUE) %>%
+#   column_to_rownames("SYMBOL") %>% 
+#   data.matrix() -> counts_matrix
+# counts_matrix %>% .[, colnames(.) != "LM2_old_2"] -> counts_matrix
+# nrow(counts_matrix)
+
+# counts_matrix %>%
+#   data.frame() %>%
+#   rownames_to_column("gene") %>%
+#   left_join(read_tsv("data/ENSEMBL/gene.lengths.grch37.tsv", skip = 1) %>%
+#               select(gene = 2, length = 3) %>% group_by(gene) %>% 
+#               summarise(across(length, mean), .groups = "keep")) %>%
+#   select(gene, length) %>%
+#   column_to_rownames("gene") %>%
+#   data.matrix() -> gene_lengths
+# gene_lengths <- subset(gene_lengths, !is.na(gene_lengths))
+# counts_matrix <- counts_matrix[rownames(gene_lengths), ]
+# gene_lengths <- as.vector(gene_lengths)
+# x <- counts_matrix / gene_lengths
+# tpm_matrix <- t(t(x) * 1e6 / colSums(x))
+# nrow(tpm_matrix)
+```
+
+```{r DESeq2}
+DESeq2_normalized_counts <- read_csv("tables/DESeq2_normalized_counts.csv") %>% 
+  column_to_rownames("gene") %>% 
+  data.matrix() -> ncounts_matrix
+ncounts_matrix %>% .[, colnames(.) != "LM2_old_2"] -> ncounts_matrix
+nrow(ncounts_matrix)
+```
+
+Plotting gene expression density:
+
+```{r density_plot}
+density_plot <- ggplot_build(ggplot() + 
+                               geom_density(aes(x = log2(rowMeans(ncounts_matrix, na.rm = TRUE) + 0.01))) + 
+                               xlab(expression(log[2]*"(mean of normalized counts + 0.01)")) +
+                               theme_linedraw() +
+                               theme(panel.grid = element_blank()))
+density_plot$plot
+```
+
+Setting cutoff:
+
+```{r cutoff}
+cutoff <- density_plot$data[[1]][which(diff(sign(diff(density_plot$data[[1]]$y))) == +2) + 1, ][1, ]
+cutoff <- 2^cutoff$x
+```
+
+Filtering gene expression matrix:
+
+```{r ncounts_matrix}
+density_plot$plot + geom_vline(xintercept = log2(cutoff), color = "red") +
+  geom_area(data = subset(density_plot$data[[1]], x > log2(cutoff)),
+            aes(x = x, y = y), fill = "blue", alpha = 0.5)
+
+ncounts_matrix <- subset(ncounts_matrix, rowMeans(ncounts_matrix, na.rm = TRUE) > cutoff)
+nrow(ncounts_matrix)
+ncounts_matrix %>% 
+  data.frame() %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/johnstone2018_ncounts.csv")
+```
+
+```{r}
+all_MR <- list()
+for (i in 1:length(names)) {
+  all_MR[[i]] <- msvpres[[i]] %>% 
+    filter(Regulon %in% rownames(ncounts_matrix)) %>% 
+    arrange(desc(NES))
+  names(all_MR)[i] <- names[i]
+}
+
+write_rds(all_MR, "tables/all_MR.rds")
+```
+
+Filtering msVIPER MRs:
+
+```{r MRs}
+MR <- list()
+for (i in 1:length(names)) {
+  MR[[i]] <- msvpres[[i]] %>% select(Regulon)
+  names(MR[[i]]) <- names[i]
+}
+MR %>% 
+  map(rownames_to_column) %>%
+  reduce(full_join, by = "rowname") %>% 
+  select(-rowname) %>% 
+  pivot_longer(cols = everything(), names_to = "msvpres", values_to = "MR") %>% 
+  drop_na() -> MR
+
+MR <- MR %>% select(MR) %>% unique() %>% filter(MR %in% rownames(ncounts_matrix))
+
+write_csv(MR, "tables/MR_list.csv")
+```
+
+Filtering msVIPER significant MRs:
+
+```{r candidates}
+candidates <- list()
+for (i in 1:length(names)) {
+  candidates[[i]] <- msvpres[[i]] %>% filter(FDR < 0.001) %>% select(Regulon)
+  names(candidates[[i]]) <- names[i]
+}
+candidates %>% 
+  map(rownames_to_column) %>%
+  reduce(full_join, by = "rowname") %>% 
+  select(-rowname) %>% 
+  pivot_longer(cols = everything(), names_to = "msvpres", values_to = "MR") %>% 
+  drop_na() -> candidates
+
+candidates <- candidates %>% select(MR) %>% unique() %>% filter(MR %in% rownames(ncounts_matrix))
+write_csv(candidates, "tables/candidates_list.csv")
+
+candidates_ncounts <- filter(data.frame(ncounts_matrix), rownames(ncounts_matrix) %in% candidates$MR) %>% 
+  rownames_to_column("MR") %>% arrange(MR)
+
+write_csv(candidates_ncounts, "tables/candidates_ncounts.csv")
+candidates_ncounts %>% column_to_rownames("MR")
+```
+
+MR candidates normalized counts across samples.
+
+```{r results}
+results <- data.frame()
+for (i in 1:length(names)) {
+  if (length(results) == 0) {
+    results <- msvpres[[i]] %>% 
+      mutate(msvpres = rep(names(msvpres)[i], nrow(msvpres[[i]]))) %>% 
+      filter(Regulon %in% candidates$MR) %>% 
+      select(msvpres, MR = Regulon, NES, FDR)
+  } else {
+    results <- rbind(results, msvpres[[i]] %>% 
+      mutate(msvpres = rep(names(msvpres)[i], nrow(msvpres[[i]]))) %>% 
+      filter(Regulon %in% candidates$MR) %>% 
+      select(msvpres, MR = Regulon, NES, FDR)
+    )
+  }
+}
+
+write_csv(results, "tables/candidates_results.csv")
+```
+
+```{r NES}
+candidates_NES <- results %>%
+  pivot_wider(id_cols = "MR", names_from = "msvpres", values_from = "NES") %>%
+  # select(MR, names(which(sapply(msvpres, nrow) > 0))) %>%
+  arrange(MR)
+
+write_csv(candidates_NES, "tables/candidates_NES.csv")
+candidates_NES %>% column_to_rownames("MR")
+```
+
+MR candidates NES.
+
+```{r FDR}
+candidates_FDR <- results %>%
+  pivot_wider(id_cols = "MR", names_from = "msvpres", values_from = "FDR") %>%
+  # select(MR, names(which(sapply(msvpres, nrow) > 0))) %>%
+  arrange(MR)
+
+write_csv(candidates_FDR, "tables/candidates_FDR.csv")
+candidates_FDR %>% column_to_rownames("MR")
+```
+
+MR candidates FDR.
+
+```{r ComplexHeatmap}
+candidates_NES %>% 
+  column_to_rownames("MR") %>%  
+  data.matrix() %>% 
+  `colnames<-`(gsub("\\_", " ", colnames(.))) %>% 
+  Heatmap(
+  name = "NES",
+  row_title = "MR",
+  show_row_names = FALSE,
+  clustering_distance_rows = "spearman",
+  clustering_method_rows = "centroid",
+  cluster_columns = FALSE,
+  col = circlize::colorRamp2(c(-7, 0, 7), c("blue", "white", "red")),
+)
+```
+
+MR candidates NES.
+
+

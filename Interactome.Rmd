@@ -1,0 +1,257 @@
+---
+title: "Interactome"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath('..'))
+knitr::opts_chunk$set(
+	error = FALSE,
+	message = FALSE,
+	warning = FALSE)
+```
+
+Loading packages:
+
+```{r packages}
+library(tidyverse)
+library(DESeq2)
+library(corto)
+library(aracne.networks)
+```
+
+Loading candidates:
+
+```{r candidates}
+candidates <- read_csv("tables/candidates_list.csv")
+```
+
+# corto
+
+The `corto` package was used to infer a regulatory network from TNBC expression data. Data was retrieved from the BRCA-US (aka TCGA) project in the PCAWG study. The PCAWG study includes five BRCA projects, two of which (BRCA-US aka TCGA and BRCA-KR) present Sequencing-based Gene Expression data. Only BRCA-US contained information about ER, PR and HER2 status by IHC, thus it was retrieved and filtered to obtain TNBC data.
+
+```{r exp_seq.TNBC}
+clinical_data <- read_tsv("data/TCGA/nationwidechildrens.org_clinical_patient_brca.txt")[-c(1, 2), ] %>% 
+  select(submitted_donor_id = bcr_patient_barcode,
+         ajcc_metastasis_pathologic_pm,
+         er_status_by_ihc,
+         pr_status_by_ihc,
+         her2_status_by_ihc)
+
+donor <- read_tsv("data/PCAWG/donor.BRCA-US.tsv") %>% 
+  select(icgc_donor_id, submitted_donor_id) %>% 
+  left_join(clinical_data)
+
+TNBC <- donor %>% 
+  filter(er_status_by_ihc == "Negative",
+         pr_status_by_ihc == "Negative",
+         her2_status_by_ihc == "Negative")
+nrow(TNBC %>% filter(ajcc_metastasis_pathologic_pm == "M1"))
+TNBC <- TNBC %>% select(-ajcc_metastasis_pathologic_pm)
+
+exp_seq.TNBC <- read_tsv_chunked("data/PCAWG/exp_seq.BRCA-US.tsv",
+                                 DataFrameCallback$new(function(x, ...) {
+                                   filter(x, icgc_donor_id %in% TNBC$icgc_donor_id)
+                                 }), chunk_size = 1e6)
+
+specimen <- read_tsv("data/PCAWG/specimen.BRCA-US.tsv") %>% 
+  select(icgc_specimen_id, specimen_type) %>% 
+  filter(str_detect(specimen_type, "Primary tumour"))
+
+exp_seq.TNBC %>% 
+  filter(icgc_specimen_id %in% specimen$icgc_specimen_id) -> exp_seq.TNBC
+
+write_tsv(exp_seq.TNBC, "tables/exp_seq.TNBC.tsv")
+```
+
+```{r TNBC_data}
+read_tsv_chunked("tables/exp_seq.TNBC.tsv",
+                 DataFrameCallback$new(function(x, ...) {
+                   select(x, icgc_sample_id, gene_id, raw_read_count) %>% filter(gene_id != "?")
+                 }), chunk_size = 1e6) %>%
+  pivot_wider(names_from = icgc_sample_id,
+              values_from = raw_read_count,
+              values_fn = mean) -> TNBC_data
+
+write_tsv(TNBC_data, "tables/exp_seq.TNBC_data.tsv")
+```
+
+```{r TNBC_matrix}
+TNBC_data <- read_tsv("tables/exp_seq.TNBC_data.tsv")
+TNBC_data %>% 
+  select(-gene_id) %>% 
+  data.matrix() %>% 
+  apply(2, as.integer) %>% 
+  `rownames<-`(TNBC_data$gene_id) %>% 
+  varianceStabilizingTransformation() -> TNBC_matrix
+```
+
+Loading centroid features:
+
+```{r centroids}
+centroids <- read_tsv("data/GO/regulation_of_transcription.tsv", 
+                      col_names = "GENE") %>% pull(GENE) %>% unique()
+```
+
+Duplicating centroid features in gene matrix, as suggested by Giorgi:
+
+```{r duplicates}
+TNBC_matrix[rownames(TNBC_matrix) %in% centroids, ] %>% 
+  `rownames<-`(paste0("centroid_", rownames(.))) %>% 
+  rbind(TNBC_matrix %>% `rownames<-`(paste0("target_", rownames(.)))) -> TNBC_matrix
+centroids %>% paste0("centroid_", .) -> centroids
+```
+
+```{r checkpoint, include=FALSE}
+TNBC_matrix[which(duplicated(rownames(TNBC_matrix))), ]
+TNBC_matrix[rownames(TNBC_matrix) == rownames(TNBC_matrix)[1], ]
+```
+
+Generating regulon:
+
+```{r corto}
+regulontnbc <- corto(TNBC_matrix, centroids = centroids, nthreads = 4)
+
+write.regulon(regulontnbc, "tables/regulontnbc.tsv")
+```
+
+```{r regulontnbc}
+regulontnbc <- read_tsv("tables/regulontnbc.tsv")
+
+regulontnbc %>% 
+  mutate(Regulator = str_replace(Regulator, "centroid_", ""),
+         Target = str_replace(Target, "target_", "")) %>% 
+  filter(Regulator != Target) -> regulontnbc
+
+write_tsv(regulontnbc, "tables/regulontnbc.tsv")
+```
+
+Looking for interactors of MR candidates:
+
+```{r, include=FALSE}
+regulontnbc <- read_tsv("tables/regulontnbc.tsv")
+```
+
+```{r}
+regulontnbc %>% 
+  ggplot(aes(likelihood)) +
+  geom_histogram(bins = 50, color = "black", fill = "gray") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank()) +
+  scale_x_continuous(n.breaks = 10)
+
+regulontnbc %>% 
+  filter(Regulator %in% candidates$MR | Target %in% candidates$MR) %>% 
+  filter(likelihood > 0.8)
+```
+
+Only 37 interactions of interest were predicted using `corto`. `regulontnbc` **was left out of the analysis**. Instead, `regulonbrca` from the `aracne.networks` package was used to identify interactors of MR candidates.
+
+```{r regulonbrca}
+regulonbrca <- read_tsv("tables/regulonbrca.tsv", col_types = "ccdd") %>% 
+  left_join(read_tsv("data/NCBI/Homo_sapiens.gene_info", col_types = cols(.default = "c")) %>% 
+              select(GeneID, Symbol), by = c("Regulator" = "GeneID")) %>% 
+  select(Regulator = Symbol, Target, MoA, likelihood) %>% 
+  left_join(read_tsv("data/NCBI/Homo_sapiens.gene_info", col_types = cols(.default = "c")) %>% 
+              select(GeneID, Symbol), by = c("Target" = "GeneID")) %>%
+  select(Regulator, Target = Symbol, MoA, likelihood)
+
+regulonbrca %>% 
+  ggplot(aes(likelihood)) +
+  geom_histogram(bins = 50, color = "black", fill = "gray") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank()) +
+  scale_x_continuous(n.breaks = 10)
+
+regulonbrca %>% 
+  filter(Regulator %in% candidates$MR | Target %in% candidates$MR & likelihood > 0.9) -> regulonbrca_interactome
+regulonbrca_interactome
+
+write_tsv(regulonbrca_interactome, "tables/regulonbrca_interactome.tsv")
+```
+
+```{r Regulators & Targets, include=FALSE}
+# network <- regulontnbc
+# 
+# intersect <- data.frame(name=network$Regulator[network$Regulator %in% network$Target])
+# genes <- c("A" = length(data.frame(network %>% select(Regulator) %>% unique())$Regulator),
+#                "A&B" = length(data.frame(intersect)$name %>% unique()),
+#                "B" = length(data.frame(network %>% select(Target) %>% unique())$Target))
+# genes <- eulerr::euler(genes)
+# plot(genes, labels = c("Regulators", "Targets"), fills = list(fill = c("springgreen", "royalblue"), alpha = 0.33), quantities = TRUE)
+```
+
+```{r Targets & centroids, include=FALSE}
+# network_reg <- regulontnbc
+# regulation_transc <- centroids
+# 
+# intersect <- data.frame(name=network_reg$Target[network_reg$Target %in% regulation_transc])
+# genes <- c("A" = length(data.frame(network_reg %>% select(Target) %>% unique())$Target),
+#                "A&B" = length(data.frame(intersect)$name %>% unique()),
+#                "B" = length(data.frame(GENE = regulation_transc) %>% unique() %>% pull(GENE)))
+# genes <- eulerr::euler(genes)
+# plot(genes, labels = c("Targets", "centroids"),
+#      fills = list(fill = c("springgreen", "royalblue"), alpha = 0.33), quantities = TRUE)
+```
+
+# REACTOME
+
+[The Reactome database](https://reactome.org/download/tools/ReatomeFIs/FIsInGene_122220_with_annotations.txt) was used to identify functional interactors of MR candidates. A score of 0.9 was selected as cutoff to filter interactions.
+
+```{r Reactome}
+Reactome_interactome <- read_tsv("data/Reactome/FIsInGene_122220_with_annotations.txt")
+
+Reactome_interactome %>% 
+  ggplot(aes(Score)) +
+  geom_histogram(bins = 50, color = "black", fill = "gray") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank()) +
+  scale_x_continuous(n.breaks = 10)
+
+Reactome_interactome %>% 
+  filter(Gene1 %in% candidates$MR | Gene2 %in% candidates$MR & Score == 1) -> Reactome_interactome
+Reactome_interactome
+
+write_tsv(Reactome_interactome, "tables/Reactome_interactome.tsv")
+```
+
+# STRING
+
+The STRING database was used to identify interactors of MR candidates. MR candidates were uploaded to the [web](https://string-db.org/) and interactions were filtered by source (co-expression, databases, experiments and gene fusion) and score (highest confidence, 0.9). 500 interactors of said MR candidates were retrieved from the 1st Shell of interaction, making up a total of 854 interactors.
+
+```{r STRING}
+# Combined score > 0.9
+STRING_interactome <- read_tsv("data/STRING/candidates_interactome.tsv")
+STRING_interactome
+
+write_tsv(STRING_interactome, "tables/STRING_interactome.tsv")
+```
+
+The interactome build from the STRING database was selected for further analysis.
+
+# TNBC mutations
+
+Mutations in TNBC samples retrieved from the COSMIC database and the PCAWG project with a FATHMM-MKL score over 0.7 were identified in active promoters of found interactors.
+
+```{r TNBC_mutations}
+TNBC_mutations <- read_csv("tables/TNBC_mutations.csv", col_types = cols(.default = "c")) %>% 
+  mutate(score = as.numeric(score)) %>% 
+  filter(score > 0.7)
+
+STRING_interactome <- read_tsv("tables/STRING_interactome.tsv")
+
+STRING_interactome_genes <- data.frame(gene = c(STRING_interactome$node1, STRING_interactome$node2)) %>% 
+  unique()
+
+write_csv(STRING_interactome_genes, "tables/STRING_interactome_genes.csv")
+
+STRING_interactome_genes %>% 
+  filter(gene %in% TNBC_mutations$gene) -> STRING_interactome_mutations
+STRING_interactome_mutations
+
+write_csv(STRING_interactome_mutations, "tables/STRING_interactome_mutations.csv")
+```
+
+

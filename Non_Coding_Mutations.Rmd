@@ -1,0 +1,379 @@
+---
+title: "Non-Coding Mutations"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath('..'))
+knitr::opts_chunk$set(
+	error = FALSE,
+	message = FALSE,
+	warning = FALSE)
+```
+
+Loading packages:
+
+```{r packages}
+library(tidyverse)
+library(rtracklayer)
+```
+
+```{r functions, include=FALSE}
+select <- dplyr::select
+slice <- dplyr::slice
+```
+
+# COSMIC
+
+Data was retrieved from COSMIC and filtered using [tabix](http://www.htslib.org/doc/tabix.html).
+
+```{bash COSMIC_promoters}
+tabix -p vcf ./data/COSMIC/CosmicNonCodingVariants.vcf.gz
+tabix -R ./tables/active_promoters.bed ./data/COSMIC/CosmicNonCodingVariants.vcf.gz > ./tables/COSMIC_promoters.vcf
+tabix -H ./data/COSMIC/CosmicNonCodingVariants.vcf.gz
+
+##fileformat=VCFv4.1
+##source=COSMICv92
+##reference=GRCh37
+##fileDate=20200701
+##comment="Missing nucleotide details indicate ambiguity during curation process"
+##comment="URL stub for ID field (use numeric portion of ID)='https://cancer.sanger.ac.uk/cosmic/ncv/overview?genome=37&id='"
+##comment="REF and ALT sequences are both forward strand
+##INFO=<ID=GENE,Number=1,Type=String,Description="Gene name">
+##INFO=<ID=STRAND,Number=1,Type=String,Description="Gene strand">
+##INFO=<ID=GENOMIC_ID,Number=1,Type=String,Description="Genomic Mutation ID">
+##INFO=<ID=LEGACY_ID,Number=1,Type=String,Description="Legacy Mutation ID">
+##INFO=<ID=CDS,Number=1,Type=String,Description="CDS annotation">
+##INFO=<ID=AA,Number=1,Type=String,Description="Peptide annotation">
+##INFO=<ID=HGVSC,Number=1,Type=String,Description="HGVS cds syntax">
+##INFO=<ID=HGVSP,Number=1,Type=String,Description="HGVS peptide syntax">
+##INFO=<ID=HGVSG,Number=1,Type=String,Description="HGVS genomic syntax">
+##INFO=<ID=CNT,Number=1,Type=Integer,Description="How many samples have this mutation">
+##INFO=<ID=SNP,Number=0,Type=Flag,Description="classified as SNP">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+```
+
+Data was filtered by overlapping with *active_promoters.bed* in order to obtain a table containing mutations on these regions with their respective FATHMM-MKL score and sample classification.
+
+```{r COSMIC_metadata}
+COSMIC_promoters <- read_tsv("tables/COSMIC_promoters.vcf",
+                             col_names = c("CHROM","POS","ID","REF","ALT","QUAL","FILTER","INFO"))
+
+COSMIC_metadata <- read_tsv_chunked("data/COSMIC/CosmicNCV.tsv.gz",
+                                    DataFrameCallback$new(function(x, ...) {
+                                      filter(x, GENOMIC_MUTATION_ID %in% COSMIC_promoters$ID)
+                                    }), chunk_size = 1e6)
+
+write_csv(COSMIC_metadata, "tables/COSMIC_metadata.csv")
+```
+
+```{r COSMIC_mutations}
+COSMIC_metadata <- read_csv("tables/COSMIC_metadata.csv")
+
+data.frame(
+  seqnames = sub(":.*", "", COSMIC_metadata$`genome position`),
+  start = sub(".*:", "", COSMIC_metadata$`genome position`) %>% sub(pattern = "-.*", replacement = "", x = .),
+  end = sub(".*-", "", COSMIC_metadata$`genome position`),
+  reference = COSMIC_metadata$WT_SEQ,
+  mutant = COSMIC_metadata$MUT_SEQ,
+  id = COSMIC_metadata$GENOMIC_MUTATION_ID,
+  score = COSMIC_metadata$FATHMM_MKL_NON_CODING_SCORE,
+  primary_site = COSMIC_metadata$`Primary site`,
+  primary_histology = COSMIC_metadata$`Primary histology`,
+  histology_subtype = COSMIC_metadata$`Histology subtype 1`
+) %>% mutate(
+  score = replace(score, score < 0, NA)
+  ) %>% GRanges() %>% 
+  sort.GenomicRanges() -> COSMIC_mutations
+```
+
+```{r promoters_mutations}
+active_promoters <- import.bed("tables/active_promoters.bed")
+
+mergeByOverlaps(COSMIC_mutations, active_promoters) %>% 
+  data.frame() %>% 
+  select(seqnames = 1, start = 2, end = 3, reference = 6, mutant = 7, gene = 25, id = 8, score = 9,
+         primary_site = 10, primary_histology = 11, histology_subtype = 12) %>% 
+  unique() -> promoters_mutations
+
+write_csv(promoters_mutations, "tables/COSMIC_mutations.csv")
+```
+
+```{r, include=FALSE}
+promoters_mutations <- read_csv("tables/COSMIC_mutations.csv")
+```
+
+```{r primary site}
+promoters_mutations %>% 
+  group_by(primary_site) %>%
+  add_tally() %>%
+  filter(n > 30 & primary_site != "NS") %>%
+  ungroup() %>% 
+  mutate(primary_site = gsub("\\_", " ", primary_site)) %>% 
+  ggplot(aes(x = primary_site, y = score, color = primary_site)) +
+  geom_jitter(width = 0.25, size = 0.5, alpha = 0.1) +
+  theme_linedraw() + theme(legend.position = "none", 
+                     axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), 
+                     panel.grid = element_blank()) +
+  xlab("") + ylab("FATHMM-MKL score") +
+  geom_hline(yintercept = 0.5, color = "red", linetype = "dashed") + 
+  geom_hline(yintercept = 0.7, color = "red", linetype = "dashed")
+```
+
+```{r histology subtype}
+promoters_mutations %>% 
+  filter(primary_site == "breast" & histology_subtype != "NS") %>% 
+  mutate(histology_subtype = gsub("\\_", " ", histology_subtype)) %>% 
+  ggplot(aes(x = histology_subtype, y = score, color = histology_subtype)) + 
+  geom_jitter(width = 0.25, size = 0.5, alpha = 0.5) +
+  theme_linedraw() + theme(legend.position = "none",
+                     axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12), 
+                     panel.grid = element_blank()) +
+  xlab("") + ylab("FATHMM-MKL score") +
+  geom_hline(yintercept = 0.5, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0.7, color = "red", linetype = "dashed")
+```
+
+```{r}
+promoters_mutations %>% 
+  filter(histology_subtype == "basal_(triple-negative)_carcinoma" & score > 0.7)
+```
+
+# PCAWG
+
+BRCA-US SSM data was retrieved from PCAWG. It was filtered by histology subtype using TCGA donor data, containing information about ER, PR and HER2 status by IHC. Donor ids were matched using PCAWG donor data. Finally, TNBC data was filtered by specimen type (*"Primary tumour"*) using PCAWG specimen data.
+
+```{r BRCA-US.TNBC}
+TCGA <- read_tsv("data/TCGA/nationwidechildrens.org_clinical_patient_brca.txt") %>% 
+  slice(-c(1, 2)) %>% 
+  select(submitted_donor_id = bcr_patient_barcode,
+         ajcc_metastasis_pathologic_pm,
+         er_status_by_ihc,
+         pr_status_by_ihc,
+         her2_status_by_ihc)
+
+donor <- read_tsv("data/PCAWG/donor.BRCA-US.tsv") %>% 
+  select(icgc_donor_id, submitted_donor_id) %>% 
+  left_join(TCGA)
+
+TNBC <- donor %>% 
+  filter(er_status_by_ihc == "Negative",
+         pr_status_by_ihc == "Negative",
+         her2_status_by_ihc == "Negative")
+nrow(TNBC %>% filter(ajcc_metastasis_pathologic_pm == "M1"))
+TNBC <- TNBC %>% select(-ajcc_metastasis_pathologic_pm)
+
+simple_somatic_mutation.open.BRCA_US.TNBC <- read_tsv_chunked("data/PCAWG/simple_somatic_mutation.open.BRCA-US.tsv.gz",
+                                                      DataFrameCallback$new(function(x, ...) {
+                                                        filter(x, icgc_donor_id %in% TNBC$icgc_donor_id)
+                                                      }), chunk_size = 1e6)
+
+specimen <- read_tsv("data/PCAWG/specimen.BRCA-US.tsv") %>% 
+  select(icgc_specimen_id, specimen_type) %>% 
+  filter(str_detect(specimen_type, "Primary tumour"))
+
+simple_somatic_mutation.open.BRCA_US.TNBC %>% 
+  filter(icgc_specimen_id %in% specimen$icgc_specimen_id) -> simple_somatic_mutation.open.BRCA_US.TNBC
+
+write_tsv(simple_somatic_mutation.open.BRCA_US.TNBC, "tables/simple_somatic_mutation.open.BRCA-US.TNBC.tsv")
+```
+
+BRCA-UK and BRCA-EU SSM data was retrieved from PCAWG. They were filtered by histology subtype with [Nik-Zainal et al. 2016](https://doi.org/10.1038/nature17676)'s [Supplementary Table 1](https://static-content.springer.com/esm/art%3A10.1038%2Fnature17676/MediaObjects/41586_2016_BFnature17676_MOESM47_ESM.zip) containing information about ER, PR and HER2 status. They were filtered by specimen type (*"Primary tumour"*) using PCAWG specimen data.
+
+```{r nik-zainal2016}
+# https://cancer.sanger.ac.uk/cosmic/sample/genomes
+clinical <- read_csv("data/nik-zainal2016/Supplementary Table 1.csv", skip = 1) %>% 
+  filter(final.ER == "negative" & final.PR == "negative" & final.HER2 == "negative")
+```
+
+```{r BRCA-UK.TNBC}
+specimen <- read_tsv("data/PCAWG/specimen.BRCA-UK.tsv") %>% 
+  select(icgc_specimen_id, specimen_type) %>% 
+  filter(str_detect(specimen_type, "Primary tumour"))
+
+sample <- read_tsv("data/PCAWG/sample.BRCA-UK.tsv") %>% 
+  filter(icgc_specimen_id %in% specimen$icgc_specimen_id) %>% 
+  mutate(submitted_sample_id = gsub(pattern = "a", replacement = "", x = .$submitted_sample_id)) %>% 
+  filter(submitted_sample_id %in% clinical$sample_name)
+
+simple_somatic_mutation.open.BRCA_UK.TNBC <- read_tsv_chunked("data/PCAWG/simple_somatic_mutation.open.BRCA-UK.tsv.gz",
+                                                      DataFrameCallback$new(function(x, ...) {
+                                                        filter(x, icgc_sample_id %in% sample$icgc_sample_id)
+                                                      }), chunk_size = 1e6)
+
+write_tsv(simple_somatic_mutation.open.BRCA_UK.TNBC, "tables/simple_somatic_mutation.open.BRCA-UK.TNBC.tsv")
+```
+
+```{r BRCA-EU.TNBC}
+specimen <- read_tsv("data/PCAWG/specimen.BRCA-EU.tsv") %>% 
+  select(icgc_specimen_id, specimen_type) %>% 
+  filter(str_detect(specimen_type, "Primary tumour"))
+
+sample <- read_tsv("data/PCAWG/sample.BRCA-EU.tsv") %>% 
+  filter(icgc_specimen_id %in% specimen$icgc_specimen_id) %>% 
+  mutate(submitted_sample_id = gsub(pattern = "a", replacement = "", x = .$submitted_sample_id)) %>% 
+  filter(submitted_sample_id %in% clinical$sample_name)
+
+simple_somatic_mutation.open.BRCA_EU.TNBC <- read_tsv_chunked("data/PCAWG/simple_somatic_mutation.open.BRCA-EU.tsv.gz",
+                                                      DataFrameCallback$new(function(x, ...) {
+                                                        filter(x, icgc_sample_id %in% sample$icgc_sample_id)
+                                                      }), chunk_size = 1e6)
+
+write_tsv(simple_somatic_mutation.open.BRCA_EU.TNBC, "tables/simple_somatic_mutation.open.BRCA-EU.TNBC.tsv")
+```
+
+```{r, include=FALSE}
+simple_somatic_mutation.open.BRCA_US.TNBC <- read_tsv("tables/simple_somatic_mutation.open.BRCA-US.TNBC.tsv")
+simple_somatic_mutation.open.BRCA_UK.TNBC <- read_tsv("tables/simple_somatic_mutation.open.BRCA-UK.TNBC.tsv")
+simple_somatic_mutation.open.BRCA_EU.TNBC <- read_tsv("tables/simple_somatic_mutation.open.BRCA-EU.TNBC.tsv")
+```
+
+```{r TNBC}
+simple_somatic_mutation.open.TNBC <- rbind(simple_somatic_mutation.open.BRCA_US.TNBC,
+                                           simple_somatic_mutation.open.BRCA_UK.TNBC,
+                                           simple_somatic_mutation.open.BRCA_EU.TNBC)
+write_tsv(simple_somatic_mutation.open.TNBC, "tables/simple_somatic_mutation.open.TNBC.tsv")
+```
+
+TNBC data was overlapped with *active_promoters.bed* in order to obtain a table containing mutations on these regions.
+
+```{r PCAWG_SSM}
+PCAWG_SSM <- read_tsv_chunked("tables/simple_somatic_mutation.open.TNBC.tsv",
+                              DataFrameCallback$new(function(x, ...) {
+                                select(x, icgc_mutation_id, chromosome, chromosome_start, chromosome_end)
+                              }), chunk_size = 1e6) %>%  
+  select(seqnames = 2, start = 3, end = 4, name = 1) %>% 
+  unique() %>% 
+  GRanges() %>% 
+  sort.GenomicRanges()
+
+active_promoters <- import.bed("tables/active_promoters.bed")
+
+mergeByOverlaps(PCAWG_SSM, active_promoters) %>% 
+  data.frame() %>% 
+  pull(7) %>% 
+  unique() -> PCAWG_ids
+
+PCAWG_SSM <- read_tsv_chunked("tables/simple_somatic_mutation.open.TNBC.tsv",
+                                  DataFrameCallback$new(function(x, ...) {
+                                    filter(x, icgc_mutation_id %in% PCAWG_ids)
+                                  }), chunk_size = 1e6)
+
+write_csv(PCAWG_SSM, "tables/PCAWG_SSM.csv")
+```
+
+```{r promoters_SSM}
+PCAWG_SSM <- read_csv("tables/PCAWG_SSM.csv")
+
+data.frame(
+  seqnames = PCAWG_SSM$chromosome,
+  start = PCAWG_SSM$chromosome_start,
+  end = PCAWG_SSM$chromosome_end,
+  reference = PCAWG_SSM$reference_genome_allele,
+  mutant = PCAWG_SSM$mutated_to_allele,
+  ENSG = PCAWG_SSM$gene_affected,
+  ENST = PCAWG_SSM$transcript_affected,
+  id = PCAWG_SSM$icgc_mutation_id,
+  project = PCAWG_SSM$project_code
+) %>% filter(!is.na(seqnames)) %>% 
+  GRanges() %>% 
+  sort.GenomicRanges() %>% 
+  data.frame() %>% 
+  left_join(read_tsv("data/ENSEMBL/grch37.tsv", col_names = c("ENSG", "ENST", "HGNC"))) %>% 
+  select(seqnames, start, end, reference, mutant, gene = HGNC, id, project) %>% 
+  filter(gene %in% mcols(active_promoters)$name) %>% 
+  unique() -> promoters_SSM
+```
+
+```{r fathmmMKL}
+data.frame(
+  Chromosome = promoters_SSM$seqnames,
+  Position = promoters_SSM$start,
+  Reference_Base = promoters_SSM$reference,
+  Mutant_Base = promoters_SSM$mutant
+) %>% unique() -> fathmmMKL_input
+
+write_csv(fathmmMKL_input, "tables/fathmmMKL_input.csv", col_names = FALSE)
+```
+
+The FATHMM-MKL score was calculated by submitting *fathmmMKL_input.csv* to the [algorithm](http://fathmm.biocompute.org.uk/fathmmMKL.htm) and retrieving *fathmmMKL_output.tab*.
+
+```{r PCAWG_mutations}
+fathmmMKL_output <- read_tsv("tables/fathmmMKL_output.tab") %>% 
+  select(seqnames = 1,
+         start = 2,
+         reference = 3,
+         mutant = 4,
+         score = 5) %>% 
+  mutate(seqnames = as.factor(seqnames))
+
+promoters_SSM %>% 
+  left_join(fathmmMKL_output) %>% 
+  relocate(project, .after = last_col()) %>% 
+  distinct(seqnames, start, end, reference, mutant, gene, score, .keep_all = TRUE) -> fathmmMKL_SSM
+
+write_csv(fathmmMKL_SSM, "tables/PCAWG_mutations.csv")
+```
+
+```{r, include=FALSE}
+fathmmMKL_SSM <- read_csv("tables/PCAWG_mutations.csv")
+```
+
+```{r PCAWG project}
+fathmmMKL_SSM %>% 
+  ggplot(aes(x = project, y = score, color = project)) + 
+  geom_jitter(width = 0.25, size = 0.5, alpha = 0.25) +
+  theme_linedraw() + theme(legend.position = "none",
+                     axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12), 
+                     panel.grid = element_blank()) +
+  xlab("") + ylab("FATHMM-MKL score") +
+  geom_hline(yintercept = 0.5, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0.7, color = "red", linetype = "dashed")
+```
+
+```{r}
+fathmmMKL_SSM %>% 
+  filter(score > 0.7)
+```
+
+# TNBC mutations
+
+```{r TNBC_mutations}
+TNBC_mutations <- rbind(
+  read_csv("tables/COSMIC_mutations.csv") %>% 
+    filter(histology_subtype == "basal_(triple-negative)_carcinoma") %>% 
+    mutate(database = "COSMIC") %>% 
+    select(seqnames, start, end, reference, mutant, gene, id, score, database),
+  read_csv("tables/PCAWG_mutations.csv") %>% 
+    mutate(database = "PCAWG") %>% 
+    select(seqnames, start, end, reference, mutant, gene, id, score, database)
+) %>% filter(!is.na(score)) %>% 
+  distinct(seqnames, start, end, reference, mutant, gene, score, .keep_all = TRUE)
+
+write_csv(TNBC_mutations, "tables/TNBC_mutations.csv")
+```
+
+```{r, include=FALSE}
+TNBC_mutations <- read_csv("tables/TNBC_mutations.csv")
+```
+
+```{r}
+TNBC_mutations %>% 
+  ggplot(aes(x = database, y = score, color = database)) + 
+  geom_jitter(width = 0.25, size = 0.5, alpha = 0.5) +
+  theme_linedraw() + theme(legend.position = "none",
+                     axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12), 
+                     panel.grid = element_blank()) +
+  xlab("") + ylab("FATHMM-MKL score") +
+  geom_hline(yintercept = 0.5, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0.7, color = "red", linetype = "dashed")
+```
+
+```{r}
+TNBC_mutations %>% 
+  filter(score > 0.7)
+```
+
+

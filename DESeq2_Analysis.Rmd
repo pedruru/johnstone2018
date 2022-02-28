@@ -1,0 +1,465 @@
+---
+title: "DESeq2 Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath('..'))
+knitr::opts_chunk$set(error = FALSE,
+                      warning = FALSE,
+                      message = FALSE)
+```
+
+Loading packages:
+
+```{r packages}
+library(tidyverse)
+library(DESeq2)
+library(geneplotter)
+library(ComplexHeatmap)
+library(IHW)
+library(ashr)
+```
+
+Loading data from [Johnstone et al. 2018](https://doi.org/10.1242/dmm.032250):
+
+```{r data}
+counts_data <- read_csv("data/johnstone2018/GSE101745_genewise-count.csv") 
+gene_ids <- read_csv("tables/gene_ids.csv", col_types = cols(.default = "c"))
+```
+
+Generating gene expression matrix:
+
+```{r matrix}
+counts_data %>% 
+  separate_rows(Name, sep = "/") %>% 
+  inner_join(gene_ids) %>% 
+  select(-c(Name, GENEID, type_of_gene)) %>% 
+  distinct(SYMBOL, .keep_all = TRUE) %>% 
+  column_to_rownames("SYMBOL") %>% 
+  data.matrix() -> counts_matrix
+```
+
+```{r gene quality control}
+# Quality control by non-zero genes
+non_zero <- apply(counts_matrix, 1, function(x) {all(x > 0)})
+sum(non_zero)
+```
+
+Generating metadata including line and batch:
+
+```{r metadata}
+metadata <- data.frame(line = factor(c(rep("NIC", 2), rep(c("LNA", "LM2", "HM"), each = 6))),
+                       batch = factor(c(rep("new", 2), rep(c(rep("new", 3), rep("old", 3)), 3)))) %>% 
+  `rownames<-`(., colnames(counts_matrix))
+```
+
+Generating DESeq2 Data Set:
+
+```{r dds}
+dds <- DESeqDataSetFromMatrix(countData = counts_matrix,
+                              colData = metadata,
+                              design = ~ line)
+```
+
+# Normalization
+
+```{r sizeFactors}
+dds <- estimateSizeFactors(dds)
+sizeFactors(dds)
+```
+
+```{r sample quality control}
+# Sample quality control by density and ecdf plots
+multidensity(counts(dds, normalized = TRUE)[non_zero, ],
+             main = "", xlab = "mean of normalized counts", ylab = "density",
+             xlim = c(0, 1000), col  = "black", legend = NULL)
+multiecdf(counts(dds, normalized = TRUE)[non_zero, ],
+          main = "", xlab = "mean of normalized counts", ylab = "f(x)",
+          xlim = c(0, 1000), col  = "black", legend = NULL)
+```
+
+# Exploratory Data Analysis
+
+### Data transformation and visualization
+
+```{r vst}
+vsd <- vst(dds, blind = FALSE)
+```
+
+Plotting heatmap of counts matrix:
+
+```{r gene heatmap}
+# set.seed(23)
+
+select <- order(rowMeans(counts(dds, normalized = TRUE)),
+                decreasing = TRUE)[1:20]
+assay(vsd)[select, ] %>% 
+  Heatmap(
+    name = "normalized counts",
+    row_title = "top 20 genes",
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    # heatmap_legend_param = list(direction = "horizontal"),
+    col = colorRampPalette(RColorBrewer::brewer.pal(9, "Blues"))(255),
+    top_annotation = HeatmapAnnotation(df = metadata, col = list(line = c("NIC" = RColorBrewer::brewer.pal(4, "Reds")[1],
+                                                                          "LNA" = RColorBrewer::brewer.pal(4, "Reds")[2],
+                                                                          "LM2" = RColorBrewer::brewer.pal(4, "Reds")[3],
+                                                                          "HM" = RColorBrewer::brewer.pal(4, "Reds")[4]), 
+                                                                 batch = c("new" = "gold1",
+                                                                           "old" = "gold3")))
+)
+```
+
+Plotting heatmap of sample-to-sample distances:
+
+```{r sample heatmap}
+data.matrix(dist(t(assay(vsd)))) %>% 
+  Heatmap(
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    col = colorRampPalette(rev(RColorBrewer::brewer.pal(9, "Blues")))(255),
+    show_heatmap_legend = FALSE
+)
+```
+
+Plotting principal component of samples:
+
+```{r PCA, eval=FALSE, include=FALSE}
+pcaData <- plotPCA(vsd, intgroup = c("line", "batch"), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(x = PC1, y = PC2, color = group)) +
+  geom_point() +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  labs(color = "line:batch") +
+  coord_fixed() +
+  theme_linedraw() +
+  theme(legend.title = element_text(face = "bold"), panel.grid = element_blank())
+```
+
+```{r PCA plotly}
+pcaData <- plotPCA(vsd, intgroup = c("line", "batch"), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+plotly::plot_ly(data = pcaData,
+                x = ~ PC1, y = ~ PC2,
+                type = "scatter", mode = "markers",
+                color = ~ group, colors = "Set1",
+                text = ~ name, hoverinfo = "text") %>% 
+  plotly::layout(legend = list(y = 0.5, title = list(text = "<b> line:batch </b>")),
+                 xaxis = list(title = paste0("PC1: ", percentVar[1], "% variance")),
+                 yaxis = list(title = paste0("PC2: ", percentVar[2], "% variance")))
+```
+
+**Removing sample LM2_old_2...**
+
+```{r removing sample outlier}
+counts_matrix %>% .[, colnames(.) != "LM2_old_2"] -> counts_matrix
+metadata %>% .[rownames(.) != "LM2_old_2", ] -> metadata
+dds <- DESeqDataSetFromMatrix(countData = counts_matrix,
+                              colData = metadata,
+                              design = ~ line)
+dds <- estimateSizeFactors(dds)
+sizeFactors(dds)
+```
+
+# Batch Effect
+
+Generating multi-factor design:
+
+```{r ddsMF}
+ddsMF <- dds
+design(ddsMF) <- formula(~ batch + line)
+```
+
+*"Model matrix not full rank"*
+
+```{r model.matrix, eval=FALSE}
+m1 <- model.matrix(~ batch * line, metadata)
+all_zero <- apply(m1, 2, function(x) all(x == 0))
+idx <- which(all_zero)
+m1 <- m1[, -idx]
+```
+
+Testing interaction:
+
+```{r ddsInt, eval=FALSE}
+ddsInt <- dds
+design(ddsInt) <- formula(~ batch + line + batch:line)
+```
+
+Applying likelihood ratio test:
+
+```{r LRT, eval=FALSE}
+summary(results(DESeq(ddsMF, test = "LRT", reduced = ~ line)))
+m2 <- model.matrix(~ batch + line, metadata)
+summary(results(DESeq(ddsInt, full = m1, test = "LRT", reduced = m2)))
+m3 <- model.matrix(~ line, metadata)
+summary(results(DESeq(ddsInt, full = m1, test = "LRT", reduced = m3)))
+```
+
+**Choosing multi-factor design...**
+
+# Differential Expression Analysis
+
+```{r estimateDispersions}
+ddsMF <- estimateDispersions(ddsMF)
+plotDispEsts(ddsMF)
+```
+
+```{r nbinomWaldTest}
+ddsMF <- nbinomWaldTest(ddsMF)
+```
+
+Generating normalized counts:
+
+```{r normalized_counts}
+normalized_counts <- data.frame(counts(ddsMF, normalized = TRUE)) %>% 
+  rownames_to_column("gene")
+write_csv(normalized_counts, "tables/DESeq2_normalized_counts.csv")
+```
+
+# Contrasts
+
+```{r cutoffs}
+# Choosing cutoffs:
+padj.cutoff = 0.05
+lfc.cutoff = 1
+```
+
+### LNA vs NIC
+
+```{r}
+res_LNA_vs_NIC <- results(ddsMF, contrast = c("line", "LNA", "NIC"), alpha = padj.cutoff, filterFun = ihw)
+# Saving results:
+data.frame(res_LNA_vs_NIC) %>% 
+  rownames_to_column() %>% 
+  write_csv(file = "tables/LNA_vs_NIC.csv")
+```
+
+```{r, include=FALSE}
+plotCounts(ddsMF, gene = which.min(res_LNA_vs_NIC$padj), intgroup = "line", xlab = "line")
+hist(res_LNA_vs_NIC$pvalue, main = "", xlab = "p-values", ylab = "frequency")
+```
+
+Shrinking LFC for visualization and ranking:
+
+```{r}
+resLFC_LNA_vs_NIC <- lfcShrink(ddsMF, res = res_LNA_vs_NIC, type = "ashr")
+# Saving results:
+data.frame(resLFC_LNA_vs_NIC) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/LFC_LNA_vs_NIC.csv")
+```
+
+```{r plotly_res, eval=FALSE, include=FALSE}
+library(plotly)
+plot_res <- function(res) {
+  # MA plot
+  maData <- plotMA(res, returnData = TRUE)
+  plot_ly(data = data.frame(res) %>% 
+            rownames_to_column("gene") %>%
+            cbind(maData) %>% 
+            mutate(threshold = padj < padj.cutoff & abs(log2FoldChange) > lfc.cutoff),
+          x = ~ log(mean), y = ~ lfc,
+          type = "scatter", mode = "markers",
+          color = ~ threshold, colors = "Set1",
+          text = ~ gene, hoverinfo = "text") %>% 
+    layout(showlegend = FALSE,
+           xaxis = list(title = "log mean of normalized counts"),
+           yaxis = list(title = "log2 fold change"))
+  # Volcano plot
+  plot_ly(data = data.frame(res) %>% 
+            rownames_to_column("gene") %>% 
+            mutate(threshold = padj < padj.cutoff & abs(log2FoldChange) > lfc.cutoff),
+          x = ~ log2FoldChange, y = ~ -log10(padj),
+          type = "scatter", mode = "markers",
+          color = ~ threshold, colors = "Set1",
+          text = ~ gene, hoverinfo = "text") %>% 
+    layout(showlegend = FALSE,
+           xaxis = list(title = "log2 fold change"),
+           yaxis = list(title = "-log10 adjusted p-value"))
+}
+```
+
+```{r plot_res}
+plot_res <- function(res) {
+  # MA plot
+  maData <- plotMA(res, returnData = TRUE)
+  maPlot <- ggplot(data.frame(res) %>% rownames_to_column("gene") %>% cbind(maData) %>% 
+                     mutate(threshold = padj < padj.cutoff & abs(log2FoldChange) > lfc.cutoff),
+                   aes(x = log(mean), y = lfc, color = threshold)) +
+    scale_color_manual(values = c("TRUE" = "cornflowerblue", "FALSE" = "gray50")) +
+    geom_point(alpha = 0.25) +
+    geom_vline(xintercept = 0) +
+    geom_hline(yintercept = 0) +
+    xlab(expression(log~"mean of normalized counts")) +
+    ylab(expression(log[2]~"fold change")) +
+    theme_linedraw() +
+    theme(legend.position = "none", panel.grid = element_blank())
+  print(maPlot)
+  # Volcano plot
+  volcanoPlot <- ggplot(data.frame(res) %>% rownames_to_column("gene") %>% 
+                          mutate(threshold = padj < padj.cutoff & abs(log2FoldChange) > lfc.cutoff),
+                        aes(x = log2FoldChange, y = -log10(padj), color = threshold)) +
+    scale_color_manual(values = c("TRUE" = "cornflowerblue", "FALSE" = "gray50")) +
+    geom_point(alpha = 0.25) +
+    geom_vline(xintercept = 0) +
+    geom_hline(yintercept = 0) +
+    xlab(expression(log[2]~"fold change")) +
+    ylab(expression(-log[10]~"adjusted p-value")) +
+    theme_linedraw() +
+    theme(legend.position = "none", panel.grid = element_blank())
+  print(volcanoPlot)
+}
+```
+
+```{r}
+plot_res(resLFC_LNA_vs_NIC)
+```
+
+**From this point forward, code will not be displayed.**
+
+#### LM2 vs NIC
+
+```{r, include=FALSE}
+res_LM2_vs_NIC <- results(ddsMF, contrast = c("line", "LM2", "NIC"), alpha = padj.cutoff, filterFun = ihw)
+# Saving results:
+data.frame(res_LM2_vs_NIC) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/LM2_vs_NIC.csv")
+```
+
+```{r, include=FALSE}
+plotCounts(ddsMF, gene = which.min(res_LM2_vs_NIC$padj), intgroup = "line", xlab = "line")
+hist(res_LM2_vs_NIC$pvalue, main = "", xlab = "p-values", ylab = "frequency")
+```
+
+```{r, include=FALSE}
+resLFC_LM2_vs_NIC <- lfcShrink(ddsMF, res = res_LM2_vs_NIC, type = "ashr")
+# Saving results:
+data.frame(resLFC_LM2_vs_NIC) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/LFC_LM2_vs_NIC.csv")
+```
+
+```{r, echo=FALSE}
+plot_res(resLFC_LM2_vs_NIC)
+```
+
+#### HM vs NIC
+
+```{r, include=FALSE}
+res_HM_vs_NIC <- results(ddsMF, contrast = c("line", "HM", "NIC"), alpha = padj.cutoff, filterFun = ihw)
+# Saving results:
+data.frame(res_HM_vs_NIC) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/HM_vs_NIC.csv")
+```
+
+```{r, include=FALSE}
+plotCounts(ddsMF, gene = which.min(res_HM_vs_NIC$padj), intgroup = "line", xlab = "line")
+hist(res_HM_vs_NIC$pvalue, main = "", xlab = "p-values", ylab = "frequency")
+```
+
+```{r, include=FALSE}
+resLFC_HM_vs_NIC <- lfcShrink(ddsMF, res = res_HM_vs_NIC, type = "ashr")
+# Saving results:
+data.frame(resLFC_HM_vs_NIC) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/LFC_HM_vs_NIC.csv")
+```
+
+```{r, echo=FALSE}
+plot_res(resLFC_HM_vs_NIC)
+```
+
+#### LM2 vs LNA
+
+```{r, include=FALSE}
+res_LM2_vs_LNA <- results(ddsMF, contrast = c("line", "LM2", "LNA"), alpha = padj.cutoff, filterFun = ihw)
+# Saving results:
+data.frame(res_LM2_vs_LNA) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/LM2_vs_LNA.csv")
+```
+
+```{r, include=FALSE}
+plotCounts(ddsMF, gene = which.min(res_LM2_vs_LNA$padj), intgroup = "line", xlab = "line")
+hist(res_LM2_vs_LNA$pvalue, main = "", xlab = "p-values", ylab = "frequency")
+```
+
+```{r, include=FALSE}
+resLFC_LM2_vs_LNA <- lfcShrink(ddsMF, res = res_LM2_vs_LNA, type = "ashr")
+# Saving results:
+data.frame(resLFC_LM2_vs_LNA) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/LFC_LM2_vs_LNA.csv")
+```
+
+```{r, echo=FALSE}
+plot_res(resLFC_LM2_vs_LNA)
+```
+
+#### HM vs LNA
+
+```{r, include=FALSE}
+res_HM_vs_LNA <- results(ddsMF, contrast = c("line", "HM", "LNA"), alpha = padj.cutoff, filterFun = ihw)
+# Saving results:
+data.frame(res_HM_vs_LNA) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/HM_vs_LNA.csv")
+```
+
+```{r, include=FALSE}
+plotCounts(ddsMF, gene = which.min(res_HM_vs_LNA$padj), intgroup = "line", xlab = "line")
+hist(res_HM_vs_LNA$pvalue, main = "", xlab = "p-values", ylab = "frequency")
+```
+
+```{r, include=FALSE}
+resLFC_HM_vs_LNA <- lfcShrink(ddsMF, res = res_HM_vs_LNA, type = "ashr")
+# Saving results:
+data.frame(resLFC_HM_vs_LNA) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/LFC_HM_vs_LNA.csv")
+```
+
+```{r, echo=FALSE}
+plot_res(resLFC_HM_vs_LNA)
+```
+
+#### HM vs LM2
+
+```{r, include=FALSE}
+res_HM_vs_LM2 <- results(ddsMF, contrast = c("line","HM", "LM2"), alpha = padj.cutoff, filterFun = ihw)
+# Saving results:
+data.frame(res_HM_vs_LM2) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/HM_vs_LM2.csv")
+```
+
+```{r, include=FALSE}
+plotCounts(ddsMF, gene = which.min(res_HM_vs_LM2$padj), intgroup = "line", xlab = "line")
+hist(res_HM_vs_LM2$pvalue, main = "", xlab = "p-values", ylab = "frequency")
+```
+
+```{r, include=FALSE}
+resLFC_HM_vs_LM2 <- lfcShrink(ddsMF, res = res_HM_vs_LM2, type = "ashr")
+# Saving results:
+data.frame(resLFC_HM_vs_LM2) %>% 
+  rownames_to_column() %>% 
+  write_csv("tables/LFC_HM_vs_LM2.csv")
+```
+
+```{r, echo=FALSE}
+plot_res(resLFC_HM_vs_LM2)
+```
+
+
+plot_res(resLFC_HM_vs_LM2)
+```
+

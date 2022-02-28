@@ -1,0 +1,385 @@
+---
+title: "Active Promoters"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath('..'))
+knitr::opts_chunk$set(
+	error = FALSE,
+	message = FALSE,
+	warning = FALSE)
+```
+
+Loading packages:
+
+```{r packages}
+library(tidyverse)
+library(rtracklayer)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(bedtoolsr)
+```
+
+```{r functions, include=FALSE}
+select <- dplyr::select
+```
+
+# FANTOM5
+
+Data was retrieved from the FANTOM5 project.
+
+```{r data}
+TSS <- GRanges(import.bed("data/FANTOM5/TSS_human.bed.gz"))
+
+normal_ctss <- import.bed("data/FANTOM5/breast%2c%20adult%2c%20donor1.CNhs11792.10080-102A8.hg19.ctss.bed.gz")
+
+MCF7_ctss <- import.bed("data/FANTOM5/breast%20carcinoma%20cell%20line%3aMCF7.CNhs11943.10482-107A5.hg19.ctss.bed.gz")
+
+MDA_MB_453_ctss <- import.bed("data/FANTOM5/breast%20carcinoma%20cell%20line%3aMDA-MB-453.CNhs10736.10419-106C5.hg19.ctss.bed.gz")
+```
+
+```{r, include=FALSE}
+# TSS <- Granges(import.bed("https://fantom.gsc.riken.jp/5/datafiles/phase1.3/extra/TSS_classifier/TSS_human.bed.gz"))
+# normal_ctss <- import.bed("https://fantom.gsc.riken.jp/5/datafiles/latest/basic/human.tissue.hCAGE/breast%252c%2520adult%252c%2520donor1.CNhs11792.10080-102A8.hg19.ctss.bed.gz")
+# MCF7_ctss <- import.bed("https://fantom.gsc.riken.jp/5/datafiles/latest/basic/human.cell_line.hCAGE/breast%2520carcinoma%2520cell%2520line%253aMCF7.CNhs11943.10482-107A5.hg19.ctss.bed.gz")
+# MDA_MB_453_ctss <- import.bed("https://fantom.gsc.riken.jp/5/datafiles/latest/basic/human.cell_line.hCAGE/breast%2520carcinoma%2520cell%2520line%253aMDA-MB-453.CNhs10736.10419-106C5.hg19.ctss.bed.gz")
+```
+
+Annotated promoters were retrieved from UCSC, considering 100 nucleotides upstream and 100 nucleotides downstream from the TSS as core promoters.
+
+```{r txdb}
+txdb <- promoters(TxDb.Hsapiens.UCSC.hg19.knownGene, upstream = 100, downstream = 100, use.names = FALSE)
+
+data.frame(mcols(txdb)) %>% 
+  select(name = tx_name) %>% 
+  left_join(read_tsv("data/UCSC/hg19.txt", skip = 1, col_names = c("name", "gene"))) -> mcols(txdb)
+
+data.frame(txdb) %>% 
+  select(-name, name = gene) %>% 
+  unique() %>% 
+  GRanges() %>% 
+  export.bed("tables/txdb.bed")
+```
+
+According to the [TSS classifier](https://fantom.gsc.riken.jp/5/datafiles/phase1.3/extra/TSS_classifier/TSSpredictionREADME.pdf), TSS were filtered with a strict threshold of *score > 0.228* in order to obtain *true_TSS*.
+
+```{r true_TSS, eval=FALSE}
+data.frame(
+  name = TSS$name,
+  gene = TSS$name,
+  score = sub(".*,", "", TSS$name)
+) %>% separate_rows(gene, sep = ",") %>% 
+  filter(str_detect(gene, "@")) %>% 
+  mutate(gene = sub(".*@", "", gene)) -> TSS_scores
+
+strict_TSS <- filter(TSS_scores, score > 0.228)
+
+true_TSS <- subset(TSS, name %in% strict_TSS$name)
+
+data.frame(mcols(true_TSS)) %>% 
+  left_join(TSS_scores, by = "name") %>% 
+  select(name, gene) %>% 
+  distinct(name, .keep_all = TRUE) -> mcols(true_TSS)
+
+write_rds(true_TSS, "tables/true_TSS.rds")
+```
+
+```{r, include=FALSE}
+true_TSS <- read_rds("tables/true_TSS.rds")
+```
+
+The Venn diagram shows promoters across databases. A subset of *true_TSS* not overlapping with annotated promoters was selected as a complement to these regions.
+
+```{r promoters venn_diagram}
+intersect <- subsetByOverlaps(txdb, true_TSS)
+subset <- subsetByOverlaps(true_TSS, txdb, invert = TRUE)
+promoters <- c("A" = length(data.frame(txdb)$name),
+               "A&B" = length(data.frame(intersect)$name),
+               "B" = length(data.frame(subset)$name))
+promoters <- eulerr::euler(promoters)
+plot(promoters, labels = c("Annotated\nPromoters", "CAGE\nPromoters"), 
+     fills = list(fill = c("springgreen", "royalblue"), alpha = 0.33), quantities = TRUE)
+```
+
+To obtain the active promoters in breast samples, ctss from three samples (Normal, MCF7 and MDA-MB-453) were overlapped with annotated promoters and its complement subset of *true_TSS*. Additionally, promoter scores were calculated as the sum of overlapped ctss scores, and gene scores as the sum of ctss scores assigned to each gene.
+
+```{r scores}
+samples <- list(normal_ctss, MCF7_ctss, MDA_MB_453_ctss)
+names(samples) <- c("Normal", "MCF7", "MDA-MB-453")
+scores <- list()
+for (i in 1:length(samples)) {
+  total <- sum(samples[[i]]$score)
+  data.frame(mcols(samples[[i]])) %>% 
+    select(ctss = name, score) %>% 
+    mutate(score = score / total) -> mcols(samples[[i]])
+  
+  mergeByOverlaps(txdb, samples[[i]]) %>% 
+    data.frame() %>% 
+    select(name, gene, ctss, score) %>% 
+    distinct(ctss, .keep_all = TRUE) %>% 
+    rbind(
+      mergeByOverlaps(subset, samples[[i]]) %>% 
+        data.frame() %>% 
+        select(name, gene, ctss, score) %>% 
+        distinct(ctss, .keep_all = TRUE)
+    ) -> merge
+
+  scores[[i]] <- merge %>%
+    group_by(name) %>% mutate(promoter_score = sum(score)) %>% ungroup() %>% 
+    group_by(gene) %>% mutate(gene_score = sum(score)) %>% ungroup() %>% 
+    select(-c(ctss, score)) %>% 
+    unique()
+  names(scores)[i] <- names(samples)[i]
+}
+```
+
+```{r results}
+df <- data.frame()
+for (i in 1:length(scores)) {
+  tmp <- cbind(scores[[i]], sample = names(scores)[i])
+  df <- rbind(df, tmp)
+}
+df <- mutate(df, sample = factor(sample, levels = names(scores)))
+```
+
+Promoters per gene were counted.
+
+```{r promoters per gene}
+df %>% 
+  select(-c(promoter_score, gene_score, sample)) %>% 
+  unique() %>% 
+  group_by(gene) %>% 
+  add_tally() %>% 
+  ungroup() %>% 
+  select(gene, n) %>% 
+  unique() %>% 
+  ggplot(aes(x = n)) +
+  geom_histogram(stat = "count", color = "black", fill = "grey") +
+  xlab("promoters per gene") +
+  ylab("gene count") +
+  ylim(c(0, 20000)) +
+  theme_linedraw() +
+  theme(panel.grid = element_blank()) +
+  scale_x_continuous(breaks = c(seq(1, 20, by = 1)), labels = c(seq(1, 19, by = 1), "20+"), limits = c(0, 21))
+```
+
+The ratio between promoter score and gene score was analyzed in order to filter promoters within genes.
+
+```{r ratio}
+df %>%
+  select(-sample) %>%
+  unique() %>%
+  mutate(ratio = promoter_score / gene_score) %>%
+  ggplot(aes(x = ratio)) +
+  geom_histogram(bins = 50, color = "black", fill = "grey") +
+  xlab(expression(over("promoter score", "gene score"))) +
+  ylab("promoter count") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank()) +
+  scale_x_continuous(n.breaks = 10)
+```
+
+With the goal of filtering promoters with fewer representation within genes, promoters were analyzed by a density plot.
+
+```{r density_plot}
+df %>% 
+  select(-sample) %>% 
+  unique() %>% 
+  mutate(ratio = promoter_score / gene_score) %>% 
+  filter(ratio < 0.5) %>% 
+  ggplot(aes(x = ratio)) +
+  geom_density() +
+  xlab(expression(over("promoter score", "gene score"))) +
+  theme_linedraw() +
+  theme(panel.grid = element_blank()) -> density_plot
+density_plot <- ggplot_build(density_plot)
+density_plot$plot
+```
+
+From plot analysis, a cutoff was chosen.
+
+```{r cutoff}
+cutoff <- density_plot$data[[1]][which(diff(sign(diff(density_plot$data[[1]]$y))) == +2) + 1, ][2, ]
+cutoff <- cutoff$x
+```
+
+A cutoff of `r signif(cutoff, 2)` was selected to filter promoters within genes by their relative score.
+
+```{r density_plot with cutoff}
+density_plot$plot + geom_vline(xintercept = cutoff, color = "red") +
+  geom_ribbon(data = subset(density_plot$data[[1]], x > cutoff),
+              aes(x = x, ymax = y, ymin = 0), fill = "blue", alpha = 0.5)
+```
+
+A empirical cumulative density function (ecdf) plot with the selected cutoff was plotted.
+
+```{r ecdf_plot}
+df %>% 
+  select(-sample) %>% 
+  unique() %>% 
+  mutate(ratio = promoter_score / gene_score) %>% 
+  filter(ratio < 0.5) %>% 
+  ggplot(aes(x = ratio)) +
+  stat_ecdf() +
+  xlab(expression(over("promoter score", "gene score"))) +
+  theme_linedraw() +
+  theme(panel.grid = element_blank()) -> ecdf_plot
+ecdf_plot <- ggplot_build(ecdf_plot)
+ecdf_plot$plot + geom_vline(xintercept = cutoff, color = "red") +
+  geom_ribbon(data = subset(ecdf_plot$data[[1]], x > cutoff),
+              aes(x = x, ymax = y, ymin = 0), fill = "blue", alpha = 0.5)
+```
+
+```{r ratio with cutoff}
+df %>% 
+  select(-sample) %>% 
+  unique() %>% 
+  mutate(ratio = promoter_score / gene_score) %>% 
+  ggplot(aes(x = ratio)) +
+  geom_histogram(bins = 50, color = "black", fill = "grey") +
+  geom_vline(xintercept = cutoff, color = "red") +
+  xlab(expression(over("promoter score", "gene score"))) +
+  ylab("promoter count") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank()) +
+  scale_x_continuous(n.breaks = 10)
+```
+
+```{r filtered results}
+df %>% 
+  filter(promoter_score > gene_score * cutoff) -> df
+```
+
+Promoters per gene were counted after filtering.
+
+```{r filtered promoters per gene}
+df %>% 
+  select(-c(promoter_score, gene_score, sample)) %>% 
+  unique() %>% 
+  group_by(gene) %>% 
+  add_tally() %>% 
+  ungroup() %>% 
+  select(gene, n) %>% 
+  unique() %>% 
+  ggplot(aes(x = n)) +
+  geom_histogram(stat = "count", color = "black", fill = "grey") +
+  xlab("promoters per gene") +
+  ylab("gene count") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank()) +
+  scale_x_continuous(breaks = c(seq(1, 8, by = 1)), labels = c(seq(1, 8, by = 1)), limits = c(0, 9))
+```
+
+The overlapping of promoter scores distributions can be interpreted as shared characteristics within analyzed samples.
+
+```{r samples density_plot}
+ggplot(df %>% filter(promoter_score > 0.0001), aes(log2(promoter_score), fill = sample)) + 
+  geom_density(alpha = 0.33) + 
+  scale_fill_manual(values = c("tomato", "springgreen", "royalblue")) + 
+  xlab(expression(log[2]*"(promoter score > 0.0001)")) + 
+  theme_linedraw() +
+  theme(legend.position = "top", legend.title = element_blank(), panel.grid = element_blank())
+```
+
+The Venn diagram shows promoters across samples. Interestingly, almost half of active promoters are shared by the three analyzed samples.
+
+```{r samples venn_diagram}
+list <- list()
+for (i in 1:length(scores)) {
+  list[[i]] <- subset(scores[[i]]$name, scores[[i]]$name %in% df$name)
+  names(list)[i] <- names(scores)[i]
+}
+list <- eulerr::euler(list)
+plot(list, fills = list(fill = c("tomato", "springgreen", "royalblue"), alpha = 0.33),
+     quantities = TRUE)
+```
+
+All active promoters were selected.
+
+```{r selected promoters}
+df %>% 
+  filter(str_starts(name, "uc")) %>% 
+  select(name, promoter_score, gene, gene_score, sample) %>% 
+  left_join(data.frame(txdb)) %>% 
+  rbind(
+    df %>% 
+      filter(str_starts(name, "p")) %>% 
+      select(name, promoter_score, gene, gene_score, sample) %>% 
+      left_join(data.frame(subset))
+  ) -> results
+```
+
+Promoter regions were reduced to a width of 1.
+
+```{r TSS}
+results_TSS <- results
+for (i in 1:nrow(results)) {
+  if (rowMeans(cbind(results$start[i], results$end[i])) %% 1 == 0) {
+    results_TSS$start[i] = results_TSS$end[i] = rowMeans(cbind(results$start[i], results$end[i]))
+  } else {
+    results_TSS$start[i] = results_TSS$end[i] = rowMeans(cbind(results$start[i], results$end[i])) - 0.5
+  }
+  results_TSS$width[i] = 1
+}
+```
+
+```{r, include=FALSE}
+results_TSS %>% 
+  select(gene) %>%
+  write_csv("tables/active_promoters.csv")
+```
+
+Finally, HGNC symbols were checked using the [multi-symbol checker](https://www.genenames.org/tools/multi-symbol-checker/) and promoter regions were extended 1000 nucleotides upstream and 200 nucleotides downstream from the TSS.
+
+```{r HGNC symbols}
+results_TSS %>% 
+  left_join(read_csv("data/HGNC/active_promoters_hgnc-symbol-check.csv", skip = 1),
+            by = c("gene" = "Input")) %>% 
+  select(seqnames, start, end, width, strand,
+         name, promoter_score, gene = `Approved symbol`, gene_score, sample) %>% 
+  filter(!is.na(gene)) -> active_promoters_TSS
+write_csv(active_promoters_TSS, "tables/active_promoters_TSS.csv")
+active_promoters_TSS %>% 
+  GRanges() %>% 
+  promoters(upstream = 1000, downstream = 200) -> active_promoters
+```
+
+CDS retrieved from UCSC were subtracted from the extended promoter regions.
+
+```{r cds}
+cds <- cds(TxDb.Hsapiens.UCSC.hg19.knownGene)
+
+subtract <- function(gr1, gr2) {
+  # Subtract GRange object gr2 from gr1, but unlike setdiff, preserve individual ranges in gr1
+  df1 = data.frame(seqnames = seqnames(gr1), start = start(gr1) - 1, end = end(gr1), strand = strand(gr1), mcols(gr1))
+  df2 = data.frame(seqnames = seqnames(gr2), start = start(gr2) - 1, end = end(gr2), strand = strand(gr2), mcols(gr2))
+  # -1 --> convert to base-0 start for bedtools
+  res = bt.subtract(df1, df2)
+  if (length(res) == 0) {
+    # subtraction has left nothing remaining. Return empty GRanges obj.
+    return(GRanges())
+  } else {
+    colnames(res) = colnames(df1)
+    res$start = res$start + 1
+    # reset to base-1 notation consistent with GRanges
+    return (GRanges(res))
+  }
+}
+
+active_promoters <- subtract(active_promoters, cds) %>% data.frame()
+```
+
+```{r active promoters}
+write_csv(active_promoters, "tables/active_promoters.csv")
+
+active_promoters %>% 
+  select(-c(name, sample), name = gene) %>% 
+  unique() %>% 
+  GRanges() %>% 
+  `seqlevelsStyle<-`("NCBI") %>% 
+  export.bed("tables/active_promoters.bed")
+```
+
+

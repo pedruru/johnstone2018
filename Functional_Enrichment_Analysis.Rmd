@@ -1,0 +1,386 @@
+---
+title: "Functional Enrichment Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath('..'))
+knitr::opts_chunk$set(
+	error = FALSE,
+	message = FALSE,
+	warning = FALSE)
+```
+
+Loading packages:
+
+```{r packages}
+library(tidyverse)
+library(ggridges)
+library(gridExtra)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ComplexHeatmap)
+library(factoextra)
+library(cluster)
+library(kableExtra)
+```
+
+```{r functions, include=FALSE}
+order <- base::order
+select <- dplyr::select
+rename <- dplyr::rename
+arrange <- dplyr::arrange
+group_by <- dplyr::group_by
+```
+
+Loading results:
+
+```{r results}
+regulonbrca <- read_tsv("tables/regulonbrca.tsv", col_types = "ccdd")
+
+NES <- read_csv("tables/candidates_NES.csv")
+
+FDR <- read_csv("tables/candidates_FDR.csv")
+
+names = c("LNA_vs_NIC", "LM2_vs_NIC", "HM_vs_NIC", "LM2_vs_LNA", "HM_vs_LNA", "HM_vs_LM2")
+LFC <- list()
+for (i in 1:length(names)) {
+  LFC[[i]] <- read_csv(paste0("tables/LFC_", names[i], ".csv")) %>% 
+    column_to_rownames()
+  names(LFC)[i] <- names[i]
+}
+LFC %>% 
+  map(select, log2FoldChange) %>% 
+  flatten() %>% 
+  data.frame() %>% 
+  `colnames<-`(names) %>% 
+  mutate("MR" = rownames(LFC[[1]])) %>% 
+  relocate(MR, .before = everything()) %>% 
+  arrange(MR) %>% 
+  filter(MR %in% NES$MR) -> LFC
+```
+
+Plotting ridgeplots:
+
+```{r ridgeplots, fig.show="hold", out.width="50%"}
+LFC %>%
+  pivot_longer(cols = -MR, names_to = "line", values_to = "LFC") %>% 
+  mutate(line = gsub("\\_", " ", line)) %>% 
+  ggplot(aes(x = LFC, y = line, fill = ..x..)) +
+  geom_density_ridges_gradient() +
+  xlab(expression(log[2]~"fold change")) + ylab("") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red") +
+  scale_y_discrete(limits = c("LNA vs NIC", "LM2 vs NIC", "HM vs NIC",
+                              "LM2 vs LNA", "HM vs LNA", "HM vs LM2")) +
+  theme_linedraw() +
+  theme(legend.position = "none", panel.grid = element_blank())
+
+NES %>% 
+  pivot_longer(cols = -MR, names_to = "line", values_to = "NES") %>% 
+  mutate(line = gsub("\\_", " ", line)) %>% 
+  ggplot(aes(x = NES, y = line, fill = ..x..)) +
+  geom_density_ridges_gradient() +
+  xlab("NES") + ylab("") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red") +
+  scale_y_discrete(limits = c("LNA vs NIC", "LM2 vs NIC", "HM vs NIC",
+                              "LM2 vs LNA", "HM vs LNA", "HM vs LM2")) +
+  theme_linedraw() +
+  theme(legend.position = "none", panel.grid = element_blank())
+```
+
+Plotting NES-LFC correlation:
+
+```{r corr, fig.show="hold", out.width="50%"}
+NES %>% 
+  left_join(LFC, by = c("MR" = "MR")) -> NES_LFC
+
+colors <- c("LNA vs NIC" = rainbow(6)[1], "LM2 vs NIC" = rainbow(6)[2],
+            "HM vs NIC" = rainbow(6)[3], "LM2 vs LNA" = rainbow(6)[4],
+            "HM vs LNA" = rainbow(6)[5], "HM vs LM2" = rainbow(6)[6])
+ggplot(NES_LFC) +
+  geom_point(aes(LNA_vs_NIC.x, LNA_vs_NIC.y, color = ifelse(abs(LNA_vs_NIC.y) < 1, "notDE", "LNA vs NIC"))) +
+  geom_point(aes(LM2_vs_NIC.x, LM2_vs_NIC.y, color = ifelse(abs(LM2_vs_NIC.y) < 1, "notDE", "LM2 vs NIC"))) +
+  geom_point(aes(HM_vs_NIC.x, HM_vs_NIC.y, color = ifelse(abs(HM_vs_NIC.y) < 1, "notDE", "HM vs NIC"))) +
+  geom_point(aes(LM2_vs_LNA.x, LM2_vs_LNA.y, color = ifelse(abs(LM2_vs_LNA.y) < 1, "notDE", "LM2 vs LNA"))) +
+  geom_point(aes(HM_vs_LNA.x, HM_vs_LNA.y, color = ifelse(abs(HM_vs_LNA.y) < 1, "notDE", "HM vs LNA"))) +
+  geom_point(aes(HM_vs_LM2.x, HM_vs_LM2.y, color = ifelse(abs(HM_vs_LM2.y) < 1, "notDE", "HM vs LM2"))) +
+  labs(x = "NES", y = expression(log[2]~"fold change"), color = "") +
+  scale_color_manual(values = colors) +
+  theme_linedraw() +
+  theme(panel.grid = element_blank())
+
+c1 <- ggplot(NES_LFC) +
+  geom_point(aes(LNA_vs_NIC.x, LNA_vs_NIC.y), color = ifelse(abs(NES_LFC$LNA_vs_NIC.y) < 1, "gray50", rainbow(6)[1])) +
+  labs(x = "NES", y = expression(log[2]~"fold change"), title = "LNA vs NIC") +
+  theme_linedraw() +
+  theme(legend.position = "none", panel.grid = element_blank())
+c2 <- ggplot(NES_LFC) +
+  geom_point(aes(LM2_vs_NIC.x, LM2_vs_NIC.y), color = ifelse(abs(NES_LFC$LM2_vs_NIC.y) < 1, "gray50", rainbow(6)[2])) +
+  labs(x = "NES", y = expression(log[2]~"fold change"), title = "LM2 vs NIC") +
+  theme_linedraw() +
+  theme(legend.position = "none", panel.grid = element_blank())
+c3 <- ggplot(NES_LFC) +
+  geom_point(aes(HM_vs_NIC.x, HM_vs_NIC.y), color = ifelse(abs(NES_LFC$HM_vs_NIC.y) < 1, "gray50", rainbow(6)[3])) +
+  labs(x = "NES", y = expression(log[2]~"fold change"), title = "HM vs NIC") +
+  theme_linedraw() +
+  theme(legend.position = "none", panel.grid = element_blank())
+c4 <- ggplot(NES_LFC) +
+  geom_point(aes(LM2_vs_LNA.x, LM2_vs_LNA.y), color = ifelse(abs(NES_LFC$LM2_vs_LNA.y) < 1, "gray50", rainbow(6)[4])) +
+  labs(x = "NES", y = expression(log[2]~"fold change"), title = "LM2 vs LNA") +
+  theme_linedraw() +
+  theme(legend.position = "none", panel.grid = element_blank())
+c5 <- ggplot(NES_LFC) +
+  geom_point(aes(HM_vs_LNA.x, HM_vs_LNA.y), color = ifelse(abs(NES_LFC$HM_vs_LNA.y) < 1, "gray50", rainbow(6)[5])) +
+  labs(x = "NES", y = expression(log[2]~"fold change"), title = "HM vs LNA") +
+  theme_linedraw() +
+  theme(legend.position = "none", panel.grid = element_blank())
+c6 <- ggplot(NES_LFC) +
+  geom_point(aes(HM_vs_LM2.x, HM_vs_LM2.y), color = ifelse(abs(NES_LFC$HM_vs_LM2.y) < 1, "gray50", rainbow(6)[6])) +
+  labs(x = "NES", y = expression(log[2]~"fold change"), title = "HM vs LM2") +
+  theme_linedraw() +
+  theme(legend.position = "none", panel.grid = element_blank())
+grid.arrange(c1, c2, c3, c4, c5, c6, ncol = 3)
+```
+
+# GSEA
+
+```{r GSEA}
+all_MR <- read_rds("tables/all_MR.rds")
+
+gsea_res <- list()
+for (i in 1:length(names)) {
+  all_MR[[i]] %>%
+  pull(NES) %>%
+  `names<-`(
+    all_MR[[i]] %>%
+      pull(Regulon) %>%
+      bitr(fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db", drop = FALSE) %>%
+      pull(ENTREZID)
+  ) -> geneList
+  gsea_res[[i]] <- gsePathway(geneList, seed = TRUE)
+  names(gsea_res)[i] <- names[i]
+  gsea_res[[i]] <- arrange(gsea_res[[i]], desc(NES))
+}
+
+write_rds(gsea_res, "tables/gsea_res.rds")
+```
+
+```{r NESplot}
+NESplot <- function(x, n = 20, cutoff = 0.05, title = NULL) {
+  x = x@result %>% arrange(desc(NES)) %>% {
+    rbind(filter(., NES > 0) %>% {if (nrow(.) >= n/2) head(., n/2) else .},
+          filter(., NES < 0) %>% {if (nrow(.) >= n/2) tail(., n/2) else .}
+    )
+  }
+  plot = ggplot(x, aes(x = NES, y = factor(Description, levels = Description[order(NES)]))) +
+    geom_bar(
+      fill = ifelse(x$p.adjust < cutoff, 
+                    ifelse(x$NES < 0, "cornflowerblue", "salmon"),
+                    "gray50"),
+      stat = "identity",
+      show.legend = FALSE
+    ) +
+    # geom_text(
+    #   label = x$setSize, 
+    #   hjust = ifelse(x$NES < 0, 1.5, -0.5),
+    #   size = 3
+    # ) +
+    labs(y = "", title = title) +
+    theme_linedraw() # +
+    # theme(panel.grid = element_blank()) 
+  return(plot)
+}
+```
+
+```{r, echo=FALSE}
+gsea_res <- read_rds("tables/gsea_res.rds")
+
+for (i in 1:6) {
+  NESplot(gsea_res[[i]]) %>% print()
+}
+```
+
+```{r}
+merge <- data.frame()
+for (i in 1:length(names)) {
+  if (length(merge) == 0) {
+    merge <- gsea_res[[i]]@result %>% 
+      mutate(contrast = rep(names(gsea_res)[i], nrow(gsea_res[[i]]))) %>% 
+      arrange(desc(NES)) %>% {
+        rbind(filter(., NES > 0) %>% {if (nrow(.) >= 10) head(., 10) else .},
+              filter(., NES < 0) %>% {if (nrow(.) >= 10) head(., 10) else .}
+        )
+      }
+  } else {
+    merge <- rbind(
+      merge, gsea_res[[i]]@result %>% 
+        mutate(contrast = rep(names(gsea_res)[i], nrow(gsea_res[[i]]))) %>% 
+        arrange(desc(NES)) %>% {
+          rbind(filter(., NES > 0) %>% {if (nrow(.) >= 10) head(., 10) else .},
+                filter(., NES < 0) %>% {if (nrow(.) >= 10) head(., 10) else .}
+          )
+        }
+    )
+  }
+}
+
+svg("plots/GSEA.svg")
+merge %>% 
+  pivot_wider(id_cols = contrast, names_from = Description, values_from = NES) %>% 
+  mutate(contrast = gsub("\\_", " ", contrast)) %>% 
+  column_to_rownames("contrast") %>% 
+  data.matrix() %>% 
+  Heatmap(
+  name = "NES",
+  row_names_side = "left",
+  column_names_side = "top",
+  # column_names_rot = 45,
+  column_names_max_height = unit(15, "cm"),
+  column_names_gp = grid::gpar(fontsize = 6),
+  border = TRUE,
+  rect_gp = grid::gpar(col = "black", lwd = 1),
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  col = circlize::colorRamp2(c(-2, 0, 4), c("blue", "white", "red"))
+  )
+dev.off()
+```
+
+```{r GSEAplot, echo=FALSE, eval=FALSE, include=FALSE}
+gsea_res <- read_rds("tables/gsea_res.rds")
+
+for (i in 1:6) {
+  gseaplot2(gsea_res[[i]], gsea_res[[i]]@result[1, 1], gsea_res[[i]]@result[1, 2]) %>% print()
+}
+```
+
+# Clustering
+
+```{r k}
+NES_clusters <- NES %>%
+  column_to_rownames("MR") %>%
+  scale()
+
+dist <- get_dist(NES_clusters, method = "spearman")
+
+fviz_dist(dist, show_labels = FALSE, gradient = list(low = "blue", mid = "white", high = "red")) +
+  labs(fill = expression(rho))
+
+fviz_nbclust(NES_clusters, cluster::pam, k.max = 25, method = "wss", diss = dist) +
+  labs(title = "") +
+  xlab("number of clusters (k)") +
+  ylab("total within sum of squares") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank())
+
+fviz_nbclust(NES_clusters, cluster::pam, k.max = 25, method = "silhouette", diss = dist) +
+  labs(title = "") +
+  xlab("number of clusters (k)") +
+  ylab("average silhouette width") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank())
+
+fviz_nbclust(NES_clusters, cluster::pam, k.max = 25, method = "gap_stat", diss = dist) +
+  labs(title = "") +
+  xlab("number of clusters (k)") +
+  ylab("gap statistic (k)") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank())
+```
+
+```{r}
+k = 4
+```
+
+```{r PAM}
+NES_PAM <- pam(dist, k, diss = TRUE, nstart = 50)
+
+NES_PAM$data <- NES_clusters
+
+fviz_cluster(NES_PAM, geom = "point", axes = c(1, 2), show.clust.cent = FALSE, shape = "circle",
+             main = "", xlab = "PC1 (66.4 %)", ylab = "PC2 (21.9 %)") +
+  labs(color = "MRC", fill = "MRC") +
+  theme_linedraw() +
+  theme(panel.grid = element_blank())
+```
+
+```{r 3D}
+# write_rds(NES_PAM, "tables/NES_PAM.rds")
+# NES_PAM <- read_rds("tables/NES_PAM.rds")
+
+prcomp <- prcomp(NES_PAM$data, rank. = 3)
+components <- prcomp[["x"]]
+components <- data.frame(components)
+components$PC2 <- -components$PC2
+components$PC3 <- -components$PC3
+components$MRC <- as.character(NES_PAM$clustering)
+
+plotly::plot_ly(components, x = ~PC1, y = ~PC2, z = ~PC3, color = ~MRC, colors = viridis::viridis(4)) %>% 
+  plotly::add_markers(size = 12) %>% 
+  plotly::layout(legend = list(title = list(text = '<b> MRC </b>')))
+```
+
+```{r MRC}
+NES_clusters <- NES %>%
+  mutate(MRC = NES_PAM$clustering) %>% 
+  group_by(MRC) %>% 
+  {aggregate(.[, 2:7], list(.$MRC), mean)} %>% 
+  ungroup() %>% 
+  rename(MRC = Group.1)
+
+NES_clusters %>% 
+  column_to_rownames("MRC") %>%  
+  data.matrix() %>% 
+  `colnames<-`(gsub("\\_", " ", colnames(.))) %>% 
+  Heatmap(
+  name = "NES",
+  row_title = "MRC",
+  row_names_side = "left",
+  # show_row_names = FALSE,
+  border = TRUE,
+  rect_gp = grid::gpar(col = "black", lwd = 1),
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  col = circlize::colorRamp2(c(-5, 0, 5), c("blue", "white", "red"))
+  )
+
+NES_PAM$clustering %>% 
+  data.frame("MRC" = .) %>% 
+  rownames_to_column("MR") -> MRC
+write_csv(MRC, "tables/MRC_list.csv")
+
+for (i in 1:k) {
+  MRC %>% 
+    filter(MRC == i) %>% 
+    select(MR) %>% 
+    write_csv(paste0("STRING/MRC", i, ".txt"), col_names = FALSE)
+}
+```
+
+# STRING
+
+With four sources of interaction information (experiments, databases, co-expression and gene fusion), a filter of highest confidence (0.900) of interaction, and the complete list of MR as universe, PPI and functional enrichment was assessed.
+
+Out of 354 nodes (MR candidates), 361 edges (interactions) of 263 expected were found. PPI enrichment p-value of 5.77E-9.
+
+```{r, echo=FALSE}
+data.frame(
+  "MRC" = c(1:4),
+  "nodes" = c(81, 89, 75, 109),
+  "edges" = c(5, 34, 17, 128),
+  "expected" = c(3, 23, 5, 51),
+  "PPI enrichment p-value" = c(0.173, 0.0227, "3.91E-5", "<1E-16"),
+  "functional enrichment" = c(FALSE, TRUE, TRUE, TRUE),
+  check.names = FALSE,
+  fix.empty.names = FALSE
+) %>% 
+  kbl(align = "llllll") %>% 
+  kable_classic("striped", full_width = FALSE, html_font = "Arial") %>% 
+  row_spec(0, bold = TRUE)
+```
+
+
